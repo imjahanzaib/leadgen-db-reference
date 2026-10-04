@@ -11,6 +11,8 @@ It covers the parts that usually go wrong on a growing platform:
 - **Moving data from a spreadsheet-style store**, reconciled to the cent, with three data checks (duplicates, dangling links, stored totals that no longer match).
 - **Adding a required foreign-key column to a busy table without blocking writes**, measured with a live writer.
 
+It has been run and checked on a **hosted Supabase project** as well as locally (details below).
+
 ![schema](docs/erd.png)
 
 ## Run it
@@ -20,7 +22,13 @@ Needs a local PostgreSQL 15+ (`psql` on your PATH; tested on 15.14). It rebuilds
 ./run_tests.sh
 ```
 
-`local/00_supabase_shim.sql` only stands in for what a hosted Supabase project already has (the `anon`, `authenticated` and `service_role` roles, `auth.users`, `auth.uid()`) so the security rules can be tested locally. It is not part of the migrations. The migrations in `supabase/migrations/` are plain SQL. I have run the suite locally; I have not pushed this to a hosted Supabase project yet.
+`local/00_supabase_shim.sql` only stands in for what a hosted Supabase project already has (the `anon`, `authenticated` and `service_role` roles, `auth.users`, `auth.uid()`) so the security rules can be tested locally. It is not part of the migrations. The migrations in `supabase/migrations/` are plain SQL.
+
+### On a hosted Supabase project
+1. Create a project (the Free plan is enough). Settings used: Data API **on**, "Automatically expose new tables" **off**, "Enable automatic RLS" **on**.
+2. In the SQL editor, run the four files in `supabase/migrations/` in order. The editor shows a "destructive operations" notice for the import function; it only drops a temp table and deletes from an empty staging table.
+3. Run `tests/supabase_verify.sql`. It returns 21 rows, all `true`, and changes nothing (every fixture is rolled back). It uses the real `anon`, `authenticated` and `service_role` roles and the real `auth.uid()`.
+4. Optional: run `seed/demo_import.sql` to load the synthetic spreadsheet export and see the reconciliation row.
 
 ## What the last run showed
 | test | result |
@@ -29,6 +37,13 @@ Needs a local PostgreSQL 15+ (`psql` on your PATH; tested on 15.14). It rebuilds
 | `02_rls` | 18 checks pass: three users on two clients, a read-only viewer, no identity, anonymous, service role, views obey RLS, audit log unreadable |
 | `03_import_and_checks` | 12 checks pass: 12 rows in = 8 loaded + 4 rejected with reasons, 863,100 cents in = out, loaded rows equal a hand-written expected set in both directions, a second run adds nothing, the 3 data checks find the planted defects |
 | `04_online_column` | 500,000 leads, a required FK column added while a writer kept inserting: backfill about 10 s in batches, worst live insert under 100 ms (52 ms and 88 ms on two runs) over about 3,000 live inserts, 0 errors |
+| hosted Supabase, 2026-10-05 | `supabase_verify.sql`: 21 of 21 checks `true`. `demo_import.sql`: 12 rows in = 8 loaded + 4 rejected, 863,100 cents in = out, 4 clients created, all 3 planted problems found. Security Advisor: 0 errors, 0 warnings, 8 info |
+
+## What running it on Supabase changed
+Running the migrations on a real project found three things the local tests could not:
+- The SQL editor warned that the `legacy` staging tables had no RLS. They are in a schema the API does not expose and the app roles cannot enter, but the rule here is RLS on every table, so migration 3 now enables it on them.
+- Security Advisor flagged six of my functions for a mutable `search_path`, and Supabase's own `public.rls_auto_enable()` (created by the automatic-RLS option) as callable by signed-in users. Migration 4 pins the `search_path` and closes that function to the API roles; a probe table confirmed automatic RLS still fires afterwards.
+- The 8 remaining Advisor items are informational "RLS enabled, no policy" notes on `audit.log` and the 7 staging tables. That is intentional: with RLS on and no policy, only the owner and the service role can read them.
 
 ## Design standards used
 | standard | where |
@@ -53,9 +68,9 @@ Needs a local PostgreSQL 15+ (`psql` on your PATH; tested on 15.14). It rebuilds
 
 ## Layout
 ```
-supabase/migrations/   three migrations: core schema, audit + guards + RLS, legacy import
-seed/                  synthetic spreadsheet-style data with planted defects
-tests/                 four test files and a helper
+supabase/migrations/   four migrations: core schema, audit + guards + RLS, legacy import, function hardening
+seed/                  synthetic spreadsheet-style data with planted defects; demo_import.sql runs it end to end
+tests/                 four test files, a helper, and supabase_verify.sql (21 checks, runs in the Supabase SQL editor)
 local/                 stand-in for Supabase roles and auth.uid() (local testing only)
 docs/                  schema diagram
 ```

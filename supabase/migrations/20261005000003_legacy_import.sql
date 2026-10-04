@@ -26,6 +26,16 @@ create table legacy.import_report (
   cents_in bigint, cents_loaded bigint, cents_rejected bigint
 );
 
+-- RLS on every table, these included. No policies: only the owner and service_role can reach them.
+-- (The schema is also not exposed through the Data API, and USAGE on it is revoked from the app roles above.)
+alter table legacy.budget_sheet        enable row level security;
+alter table legacy.sheet_leads         enable row level security;
+alter table legacy.sheet_deliveries    enable row level security;
+alter table legacy.sheet_invoices      enable row level security;
+alter table legacy.sheet_invoice_lines enable row level security;
+alter table legacy.import_rejects      enable row level security;
+alter table legacy.import_report       enable row level security;
+
 create function legacy.parse_cents(t text) returns bigint language sql immutable as $$
   select case when regexp_replace(coalesce(t, ''), '[^0-9.]', '', 'g') ~ '^[0-9]+(\.[0-9]{1,2})?$'
               then round(regexp_replace(t, '[^0-9.]', '', 'g')::numeric * 100)::bigint end
