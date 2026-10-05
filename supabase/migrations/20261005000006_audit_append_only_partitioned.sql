@@ -2,7 +2,7 @@
 -- Before this migration audit.log was a plain table: nothing stopped an UPDATE or DELETE, it grew without bound, and a row
 -- did not say which API role, JWT or request produced it.
 --
--- What this does NOT stop: the table owner (the `postgres` role) can still disable a trigger or drop the table.
+-- What this does NOT stop: the table owner (the postgres role) can still disable a trigger or drop the table.
 -- The application only ever connects as anon / authenticated / service_role, none of which can. Evidence that must survive
 -- the owner too has to leave the database (log shipping, pgaudit); see the README.
 

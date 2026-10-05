@@ -7,7 +7,7 @@
 --     gap-free number for that client. Nobody picks a number.
 --   * An issued invoice never changes: not its columns, not its lines, and it cannot be deleted.
 --   * A correction is a credit note: a new, immutable document that points at the invoice and carries its own number.
---   * Money has a currency. A client has one, fixed at creation; its invoices and credit notes must match it.
+--   * Money has a currency. A client has one, correctable until money is recorded in it; its invoices and credit notes must match it.
 --   * The links that decide which client a delivery belongs to (delivery -> lead -> market -> client) are write-once, so
 --     nothing can be moved underneath an issued invoice.
 

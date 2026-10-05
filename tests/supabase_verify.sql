@@ -175,8 +175,15 @@ begin
     res := pg_temp.rec(res, 'audit: even the table owner is stopped by the trigger (TRUNCATE)', r = '42501', r);
 
     select count(*) into k from information_schema.role_table_grants
-      where grantee = 'service_role' and table_schema = 'public' and privilege_type in ('TRUNCATE', 'TRIGGER', 'REFERENCES');
-    res := pg_temp.rec(res, 'privileges: service_role holds no TRUNCATE, TRIGGER or REFERENCES on any public table', k = 0, k::text);
+      where grantee in ('anon', 'authenticated', 'service_role') and table_schema = 'public' and privilege_type in ('TRUNCATE', 'TRIGGER', 'REFERENCES');
+    res := pg_temp.rec(res, 'privileges: anon, authenticated and service_role hold no TRUNCATE, TRIGGER or REFERENCES on any public table', k = 0, k::text);
+    if current_setting('server_version_num')::int >= 170000 then
+      execute $e$select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace, unnest(array['anon', 'authenticated', 'service_role']) r
+                 where n.nspname = 'public' and c.relkind in ('r', 'v', 'p') and has_table_privilege(r, c.oid, 'MAINTAIN')$e$ into k;
+      res := pg_temp.rec(res, 'privileges: no API role holds MAINTAIN on a public table (Postgres 17)', k = 0, k::text);
+    else
+      res := pg_temp.rec(res, 'privileges: no API role holds MAINTAIN on a public table (Postgres 17)', true, 'not applicable before 17');
+    end if;
     res := pg_temp.rec(res, 'privileges: service_role cannot SET session_replication_role (it would switch triggers off)',
                        not has_parameter_privilege('service_role', 'session_replication_role', 'SET'), 'has_parameter_privilege');
 

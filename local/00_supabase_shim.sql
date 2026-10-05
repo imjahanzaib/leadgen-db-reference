@@ -13,3 +13,9 @@ create or replace function auth.uid() returns uuid language sql stable as $$
 $$;
 grant usage on schema auth to anon, authenticated, service_role;
 grant execute on function auth.uid() to anon, authenticated, service_role;
+
+-- What a hosted Supabase project does to every table the migrations create in public, even with "Automatically expose new
+-- tables" OFF (read from pg_default_acl on the hosted project, 2026-10-05): the three API roles get TRUNCATE, REFERENCES and
+-- TRIGGER (and MAINTAIN on Postgres 17) by default. The local tests must see the same, or a revoke that comes too early
+-- (before a later table or view exists) passes here and leaks there.
+alter default privileges in schema public grant truncate, references, trigger on tables to anon, authenticated, service_role;
