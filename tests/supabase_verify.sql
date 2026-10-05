@@ -1,4 +1,4 @@
--- Run this in the Supabase SQL editor (or psql) AFTER the three migrations.
+-- Run this in the Supabase SQL editor (or psql) AFTER all seven migrations.
 -- It changes nothing: every fixture is rolled back. It returns one row per check.
 -- Real roles (anon, authenticated, service_role) and real auth.uid() are used, so this tests the actual security setup.
 
@@ -19,6 +19,9 @@ declare
   la uuid := gen_random_uuid(); lb uuid := gen_random_uuid();
   da uuid := gen_random_uuid(); db uuid := gen_random_uuid();
   ia uuid := gen_random_uuid();
+  cf uuid := gen_random_uuid(); mf uuid := gen_random_uuid(); mz uuid := gen_random_uuid();
+  lf1 uuid := gen_random_uuid(); lf2 uuid := gen_random_uuid(); lz uuid := gen_random_uuid();
+  df1 uuid := gen_random_uuid(); df2 uuid := gen_random_uuid(); dz uuid := gen_random_uuid(); i1 uuid := gen_random_uuid();
   r text; k bigint;
 begin
   -- Fixtures and checks run inside a sub-transaction that is rolled back at the end.
@@ -105,6 +108,69 @@ begin
     select count(*) into k from public.clients where name like 'Verify Client%';
     res := pg_temp.rec(res, 'rls: the service role sees both (server side only)', k = 2, k::text);
     reset role;
+
+    -- E. time zones, billing integrity and the audit log (migrations 5 to 7). Fresh fixtures, so the counts above stay as they were.
+    insert into public.clients (id, name) values (cf, 'Verify Client F');
+    insert into public.markets (id, client_id, name, timezone) values (mf, cf, 'F-NY', 'America/New_York'), (mz, cf, 'F-Auckland', 'Pacific/Auckland');
+    insert into public.market_budgets (market_id, service_type_id, budget_month, amount_cents)
+      values (mf, st, '2026-01-01', 1000), (mf, st, '2026-02-01', 1000), (mz, st, '2026-02-01', 1000);
+    insert into public.leads (id, market_id, service_type_id, source_system, source_id, received_at) values
+      (lf1, mf, st, 'verify', 'f1', timestamptz '2026-01-31 23:59 America/New_York'),
+      (lf2, mf, st, 'verify', 'f2', timestamptz '2026-02-01 00:01 America/New_York'),
+      (lz,  mz, st, 'verify', 'f3', timestamptz '2026-02-01 00:01 Pacific/Auckland');
+    insert into public.lead_deliveries (id, lead_id, contractor_id, delivered_at, price_cents)
+      values (df1, lf1, ct, now(), 7), (df2, lf2, ct, now(), 11), (dz, lz, ct, now(), 13);
+
+    r := pg_temp.try(format($q$insert into public.markets (client_id, name, timezone) values (%L, 'Bad', 'Mars/Base')$q$, cf));
+    res := pg_temp.rec(res, 'time zone: an unknown zone name is refused', r = '23514', r);
+    select delivered_cents into k from public.budget_vs_spend where market_id = mf and budget_month = '2026-01-01';
+    res := pg_temp.rec(res, 'time zone: New York 23:59 on 31 Jan counts in January (7)', k = 7, k::text);
+    select delivered_cents into k from public.budget_vs_spend where market_id = mf and budget_month = '2026-02-01';
+    res := pg_temp.rec(res, 'time zone: New York 00:01 on 1 Feb counts in February (11)', k = 11, k::text);
+    select delivered_cents into k from public.budget_vs_spend where market_id = mz and budget_month = '2026-02-01';
+    res := pg_temp.rec(res, 'time zone: Auckland 00:01 on 1 Feb (still 31 Jan in UTC) counts in February (13)', k = 13, k::text);
+
+    insert into public.invoices (id, client_id, period_start, period_end) values (i1, cf, '2026-01-01', '2026-01-31');
+    insert into public.invoice_lines (invoice_id, lead_delivery_id) values (i1, df1);
+    update public.invoices set issued_at = now() where id = i1;
+    select invoice_number into r from public.invoices where id = i1;
+    res := pg_temp.rec(res, 'billing: issuing numbers the invoice INV-000001', r = 'INV-000001', r);
+    r := pg_temp.try(format($q$update public.invoices set period_end = '2026-01-15' where id = %L$q$, i1));
+    res := pg_temp.rec(res, 'billing: an issued invoice''s period is fixed', r = '23514', r);
+    r := pg_temp.try(format($q$insert into public.invoice_lines (invoice_id, lead_delivery_id) values (%L, %L)$q$, i1, df2));
+    res := pg_temp.rec(res, 'billing: a line cannot be added to an issued invoice', r = '23514', r);
+    r := pg_temp.try(format($q$delete from public.invoices where id = %L$q$, i1));
+    res := pg_temp.rec(res, 'billing: an issued invoice cannot be deleted', r = '23514', r);
+    insert into public.credit_notes (client_id, invoice_id, currency, amount_cents, reason) values (cf, i1, 'USD', 5, 'verify correction');
+    select credit_number into r from public.credit_notes where invoice_id = i1;
+    res := pg_temp.rec(res, 'billing: a correction is a credit note, numbered CN-000001', r = 'CN-000001', r);
+    r := pg_temp.try(format($q$insert into public.credit_notes (client_id, invoice_id, currency, amount_cents, reason) values (%L, %L, 'USD', 3, 'too much')$q$, cf, i1));
+    res := pg_temp.rec(res, 'billing: credits cannot exceed the invoice total (7 - 5 = 2 left)', r = '23514', r);
+    r := pg_temp.try(format($q$update public.credit_notes set amount_cents = 1 where invoice_id = %L$q$, i1));
+    res := pg_temp.rec(res, 'billing: a credit note cannot be edited', r = '23514', r);
+
+    set local role authenticated;
+    perform set_config('request.jwt.claims', json_build_object('sub', ua, 'role', 'authenticated')::text, true);
+    perform set_config('request.headers', '{"x-request-id":"verify-req-1"}', true);
+    insert into public.markets (client_id, name) values (ca, 'Audit-ctx');
+    reset role;
+    perform set_config('request.jwt.claims', '', true);
+    perform set_config('request.headers', '', true);
+    select count(*) into k from audit.log where table_name = 'markets' and new_row ->> 'name' = 'Audit-ctx'
+       and actor = ua and jwt_role = 'authenticated' and effective_role = 'authenticated' and request_id = 'verify-req-1';
+    res := pg_temp.rec(res, 'audit: a change through the API records the user, JWT role, effective role and request id', k = 1, k::text);
+    res := pg_temp.rec(res, 'audit: the current month has its partition',
+                       to_regclass('audit.log_' || to_char(now() at time zone 'UTC', 'YYYY_MM')) is not null, 'partition');
+    set local role service_role;
+    r := pg_temp.try($q$update audit.log set op = op$q$);
+    res := pg_temp.rec(res, 'audit: service_role cannot UPDATE the log', r = '42501', r);
+    r := pg_temp.try($q$delete from audit.log$q$);
+    res := pg_temp.rec(res, 'audit: service_role cannot DELETE from the log', r = '42501', r);
+    reset role;
+    r := pg_temp.try($q$delete from audit.log$q$);
+    res := pg_temp.rec(res, 'audit: even the table owner is stopped by the trigger (DELETE)', r = '42501', r);
+    r := pg_temp.try($q$truncate audit.log$q$);
+    res := pg_temp.rec(res, 'audit: even the table owner is stopped by the trigger (TRUNCATE)', r = '42501', r);
 
     raise exception 'rollback everything' using errcode = 'P0099';
   exception when sqlstate 'P0099' then null;
