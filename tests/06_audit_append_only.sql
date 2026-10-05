@@ -142,5 +142,9 @@ create table cron.calls (jobname text, schedule text, command text);
 create function cron.schedule(p_job text, p_schedule text, p_command text) returns bigint language sql as $f$
   insert into cron.calls values (p_job, p_schedule, p_command) returning 1::bigint $f$;
 select pg_temp.ok(audit.schedule_maintenance() is true, 'with pg_cron present, schedule_maintenance returns true');
-select pg_temp.ok((select array_agg(command order by jobname) from cron.calls) = array['select audit.drop_old_partitions(24)', 'select audit.ensure_partitions()'], 'it schedules the partition job and the retention job');
+select pg_temp.ok((select array_agg(command) from cron.calls) = array['select audit.ensure_partitions()'], 'by default it schedules only the harmless partition job, NOT the retention that deletes history');
+delete from cron.calls;
+select pg_temp.ok(audit.schedule_maintenance(24) is true, 'scheduling with a keep period returns true');
+select pg_temp.ok((select array_agg(command order by jobname) from cron.calls) = array['select audit.drop_old_partitions(24)', 'select audit.ensure_partitions()'], 'retention is scheduled only when asked for, with the keep period given');
+select pg_temp.expect($$select audit.schedule_maintenance(6)$$, 'P0001', 'and scheduling retention below 12 months is refused');
 rollback;

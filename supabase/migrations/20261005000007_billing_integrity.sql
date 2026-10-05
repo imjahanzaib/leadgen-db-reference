@@ -12,12 +12,17 @@
 --     nothing can be moved underneath an issued invoice.
 
 begin;
+set local lock_timeout = '5s';   -- give up instead of queueing behind a long transaction (and everything behind it)
 
 ------------------------------------------------------------------ currency
 alter table public.clients add column currency char(3) not null default 'USD' check (currency ~ '^[A-Z]{3}$');
 alter table public.clients add constraint clients_id_currency_key unique (id, currency);
 
-alter table public.invoices add column currency char(3) not null default 'USD' check (currency ~ '^[A-Z]{3}$');
+-- An invoice's currency is its client's: left out on insert, the guard below fills it in. (A default of 'USD' would make an
+-- EUR client's invoices fail until the caller remembered to pass the currency.)
+alter table public.invoices add column currency char(3) check (currency ~ '^[A-Z]{3}$');
+update public.invoices i set currency = c.currency from public.clients c where c.id = i.client_id;
+alter table public.invoices alter column currency set not null;
 alter table public.invoices add column invoice_number text;
 alter table public.invoices add constraint invoices_id_client_currency_key unique (id, client_id, currency);
 -- the invoice must be in its client's currency; a client's currency cannot change while an invoice exists (RESTRICT)
@@ -71,6 +76,10 @@ begin
     if new.issued_at is not null or new.invoice_number is not null then
       raise exception 'invoices start as drafts; set issued_at on an existing draft to issue it' using errcode = 'check_violation';
     end if;
+    if new.currency is null then
+      select currency into new.currency from public.clients where id = new.client_id;
+      if not found then raise exception 'client % does not exist', new.client_id using errcode = 'foreign_key_violation'; end if;
+    end if;
     return new;
   end if;
 
@@ -89,6 +98,9 @@ begin
       raise exception 'an invoice with no lines cannot be issued' using errcode = 'check_violation';
     end if;
     new.invoice_number := private.next_document_number(new.client_id, 'invoice');
+    -- The value the caller sent only means "issue it". The time is taken here, after the counter row is locked, so numbers
+    -- and dates always run in the same order (a caller-chosen or transaction-start time could put INV-2 before INV-1).
+    new.issued_at := clock_timestamp();
   end if;
   return new;
 end $$;
@@ -107,6 +119,9 @@ begin
     end if;
   end if;
   if tg_op in ('INSERT', 'UPDATE') then
+    -- Lock the delivery as well. Its price is frozen only once it is on an invoice, and the price guard cannot see a line that
+    -- is still uncommitted; FOR SHARE here makes a concurrent price change wait for this transaction, then be refused.
+    perform 1 from public.lead_deliveries where id = new.lead_delivery_id for share;
     select issued_at into v_new from public.invoices where id = new.invoice_id for share;
     if v_new is not null then
       raise exception 'invoice % is issued; lines cannot be added or moved to it', new.invoice_id using errcode = 'check_violation';
@@ -131,7 +146,22 @@ end $$;
 create trigger markets_client_fixed         before update of client_id  on public.markets         for each row execute function private.guard_immutable('client_id');
 create trigger leads_market_fixed           before update of market_id  on public.leads           for each row execute function private.guard_immutable('market_id');
 create trigger deliveries_lead_fixed        before update of lead_id    on public.lead_deliveries for each row execute function private.guard_immutable('lead_id');
-create trigger clients_currency_fixed       before update of currency   on public.clients         for each row execute function private.guard_immutable('currency');
+
+-- A client's currency may be corrected until money is recorded in it (budgets, deliveries, invoices); after that it is fixed,
+-- because the same cents would mean a different amount.
+create function private.guard_client_currency() returns trigger language plpgsql security definer set search_path = '' as $$
+begin
+  if new.currency is distinct from old.currency and (
+       exists (select 1 from public.invoices where client_id = new.id)
+    or exists (select 1 from public.market_budgets b join public.markets m on m.id = b.market_id where m.client_id = new.id)
+    or exists (select 1 from public.lead_deliveries d join public.leads l on l.id = d.lead_id
+               join public.markets m on m.id = l.market_id where m.client_id = new.id)) then
+    raise exception 'client % already has money recorded in %: its currency cannot change', new.id, old.currency using errcode = 'check_violation';
+  end if;
+  return new;
+end $$;
+create trigger clients_currency_fixed before update of currency on public.clients
+  for each row execute function private.guard_client_currency();
 
 ------------------------------------------------------------------ credit notes
 create table public.credit_notes (
@@ -161,6 +191,10 @@ begin
   if new.credit_number is not null then
     raise exception 'credit numbers are assigned by the database' using errcode = 'check_violation';
   end if;
+  -- A retried INSERT ... ON CONFLICT (id) DO NOTHING reaches this trigger BEFORE the conflict is found. Hand it the stored
+  -- number instead of using up a new one (a plain duplicate INSERT then fails on the primary key as it should).
+  select credit_number into new.credit_number from public.credit_notes where id = new.id;
+  if found then return new; end if;
   select issued_at into v_issued from public.invoices where id = new.invoice_id for update;
   if not found then
     raise exception 'invoice % does not exist', new.invoice_id using errcode = 'foreign_key_violation';
@@ -176,7 +210,7 @@ begin
       using errcode = 'check_violation';
   end if;
   new.credit_number := private.next_document_number(new.client_id, 'credit_note');   -- assigned here, never supplied
-  new.issued_at := now();
+  new.issued_at := clock_timestamp();    -- after the counter lock, so numbers and dates agree
   return new;
 end $$;
 create trigger credit_notes_guard before insert or update or delete on public.credit_notes
@@ -193,7 +227,10 @@ alter table private.document_counters enable row level security;
 revoke all on private.document_counters from public, anon, authenticated, service_role;
 revoke all on public.credit_notes from public, anon, authenticated;   -- a project that auto-exposes new tables would have granted these
 grant select on public.credit_notes to authenticated;
-grant all on public.credit_notes to service_role;
+grant select, insert on public.credit_notes to service_role;    -- no update, delete, truncate or trigger: a credit note is written once
+-- Migration 2 gave service_role every privilege on every table. It never needs to create triggers, add references or
+-- truncate (TRUNCATE leaves no audit row), so take those three away from all tables that exist now.
+revoke trigger, references, truncate on all tables in schema public from service_role;
 revoke all on function private.next_document_number(uuid, text), private.guard_invoice(), private.guard_invoice_line_edit(),
   private.guard_immutable(), private.guard_credit_note(), private.deny_truncate() from public, anon, authenticated, service_role;
 create policy credit_notes_read on public.credit_notes for select to authenticated using (private.is_member(client_id));
@@ -210,6 +247,6 @@ left join public.credit_notes c on c.invoice_id = t.invoice_id
 group by t.invoice_id, t.client_id, i.invoice_number, i.currency, t.total_cents;
 revoke all on public.invoice_balances from public, anon, authenticated;
 grant select on public.invoice_balances to authenticated;
-grant all on public.invoice_balances to service_role;
+grant select on public.invoice_balances to service_role;
 
 commit;

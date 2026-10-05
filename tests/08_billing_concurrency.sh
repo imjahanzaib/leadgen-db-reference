@@ -24,10 +24,10 @@ insert into public.service_types (id, code, name) values ('$(U 21)', 'roofing', 
 insert into public.contractors (id, name) values ('$(U 31)', 'Pro');
 insert into public.leads (id, market_id, service_type_id, source_system, source_id, received_at)
   select ('00000000-8888-0000-0001-' || lpad(g::text, 12, '0'))::uuid, case when g <= 8 then '$(U 11)' else '$(U 12)' end::uuid, '$(U 21)', 'race', g::text, now()
-  from generate_series(1, 10) g;
+  from generate_series(1, 14) g;
 insert into public.lead_deliveries (id, lead_id, contractor_id, delivered_at, price_cents)
   select ('00000000-8888-0000-0002-' || lpad(g::text, 12, '0'))::uuid, ('00000000-8888-0000-0001-' || lpad(g::text, 12, '0'))::uuid, '$(U 31)', now(), 500
-  from generate_series(1, 10) g;
+  from generate_series(1, 14) g;
 SQL
 D() { echo "00000000-8888-0000-0002-$(printf '%012d' "$1")"; }
 I() { echo "00000000-8888-0000-0003-$(printf '%012d' "$1")"; }
@@ -74,5 +74,38 @@ wait_for_waiter && pass "4a. the second credit note waits for the first" || fail
 wait
 grep -q "would exceed" "$T/4.out" && pass "4b. after the first commits, the second is refused (600 + 600 > 1000)" || fail "4b. not refused: $(cat "$T/4.out")"
 [ "$($P -c "select coalesce(sum(amount_cents), 0) from public.credit_notes where invoice_id = '$(I 5)'")" = 600 ] && pass "4c. exactly 600 is credited" || fail "4c. credited total wrong"
+# ---- 5. a delivery's price changes while its line is being added and the invoice issued: the line waits, so the invoice is issued with the NEW price
+mkdraft 6 "$(U 2)" 11
+$P -c "begin; update public.lead_deliveries set price_cents = 1 where id = '$(D 12)'; select pg_sleep(4); commit;" >/dev/null &
+sleep 0.5
+( $P -c "begin; insert into public.invoice_lines (invoice_id, lead_delivery_id) values ('$(I 6)', '$(D 12)'); update public.invoices set issued_at = now() where id = '$(I 6)'; commit;" >"$T/5.out" 2>&1 || true ) &
+wait_for_waiter && pass "5a. adding a line waits while the delivery's price is being changed" || fail "5a. no wait: $(cat "$T/5.out")"
+wait
+[ "$($P -c "select total_cents from public.invoice_totals where invoice_id = '$(I 6)'")" = 501 ] && pass "5b. the invoice was issued with the new price (500 + 1), so its total cannot move afterwards" || fail "5b. total wrong: $(cat "$T/5.out")"
+$P -c "update public.lead_deliveries set price_cents = 9 where id = '$(D 12)'" >"$T/5c.out" 2>&1 || true
+grep -q "price is frozen" "$T/5c.out" && pass "5c. and the price is frozen from then on" || fail "5c. price changed after issue"
+
+# ---- 5'. the other order: the line is added and the invoice issued first; the price change waits, then is refused
+mkdraft 7 "$(U 2)" 13
+$P -c "begin; insert into public.invoice_lines (invoice_id, lead_delivery_id) values ('$(I 7)', '$(D 14)'); update public.invoices set issued_at = now() where id = '$(I 7)'; select pg_sleep(4); commit;" >/dev/null &
+sleep 0.5
+( $P -c "update public.lead_deliveries set price_cents = 1 where id = '$(D 14)'" >"$T/5d.out" 2>&1 || true ) &
+wait_for_waiter && pass "5d. the price change waits while the line is being billed" || fail "5d. no wait"
+wait
+grep -q "price is frozen" "$T/5d.out" && pass "5e. then it is refused: the delivery is billed" || fail "5e. not refused: $(cat "$T/5d.out")"
+[ "$($P -c "select price_cents from public.lead_deliveries where id = '$(D 14)'")" = 500 ] && pass "5f. the price is unchanged (500)" || fail "5f. price changed"
+
+# ---- 6. a FRESH session as service_role: no 'permission denied for schema private' (a cached plan hid it inside one session)
+$P -c "set role service_role; insert into public.markets (client_id, name) values ('$(U 1)', 'svc-1'); update public.markets set timezone = 'America/Chicago' where name = 'svc-1'; select count(*) from public.budget_vs_spend;" >"$T/6.out" 2>&1 \
+  && pass "6. a fresh service_role session can insert and re-zone a market and read budget_vs_spend" || fail "6. service_role failed: $(cat "$T/6.out")"
+
+# ---- 7. creating the next audit partition must not stall behind an open audited write
+$P -c "begin; insert into public.markets (client_id, name) values ('$(U 1)', 'hold-open'); select pg_sleep(4); commit;" >/dev/null &
+sleep 0.5
+SECONDS=0
+$P -c "select audit.ensure_partitions('2031-01-01', '2031-01-01')" >"$T/7.out" 2>&1 || true
+[ "$SECONDS" -lt 3 ] && [ "$(cat "$T/7.out")" = 1 ] && pass "7a. a new audit partition was created in under 3 s while another transaction held an audited write open" || fail "7a. creating the partition stalled ($SECONDS s): $(cat "$T/7.out")"
+$P -c "begin; insert into public.markets (client_id, name) values ('$(U 1)', 'during-ddl'); commit;" >"$T/7b.out" 2>&1 && pass "7b. and ordinary audited writes keep working" || fail "7b. write failed: $(cat "$T/7b.out")"
+wait
 echo "   concurrency tests passed"
 psql -d postgres -q -c "drop database if exists $DB"

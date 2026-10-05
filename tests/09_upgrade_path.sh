@@ -62,6 +62,9 @@ $P -c "insert into public.clients (name) values ('Up New')" >/dev/null
 $P -c "update public.invoices set issued_at = now() where id = '00000000-9999-0000-0003-000000000003'" >/dev/null
 [ "$($P -c "select invoice_number from public.invoices where id = '00000000-9999-0000-0003-000000000003'")" = "INV-000003" ] && pass "issuing the draft continues the series: INV-000003" || fail "counter not set from backfill"
 [ "$($P -c "select count(*) from public.clients where currency <> 'USD'")" = 0 ] && [ "$($P -c "select count(*) from public.invoices where currency <> 'USD'")" = 0 ] && pass "existing clients and invoices became USD" || fail "currency backfill"
+[ "$($P -c "select count(*) from public.invoices where currency is null")" = 0 ] && pass "every existing invoice got its client's currency (none left NULL)" || fail "currency backfill left NULLs"
+[ "$($P -c "select (issued_at at time zone 'UTC')::text from public.invoices where id = '00000000-9999-0000-0003-000000000001'")" = "2026-03-01 09:00:00" ] \
+  && pass "an invoice issued before the migration keeps its original issue time (stamping applies to new issues only)" || fail "issue time of an old invoice changed"
 [ "$($P -c "select count(*) from public.budget_vs_spend")" = 0 ] && pass "budget_vs_spend still answers after the view was replaced" || fail "view broken"
 
 # ---- a bad time zone must stop migration 5 and leave nothing behind
@@ -71,6 +74,6 @@ $P -c "insert into public.clients (id, name) values ('00000000-9999-0000-0000-00
 OUT="$(mktemp)"; trap 'rm -f "$OUT"' EXIT
 if $P -f supabase/migrations/20261005000005_market_timezones.sql >"$OUT" 2>&1; then fail "migration 5 accepted a bad time zone"; fi
 grep -q "not IANA zone names (Central Time)" "$OUT" && pass "a bad time zone stops migration 5 with a message naming it" || fail "migration 5 failed, but not with the expected message: $(cat "$OUT")"
-[ "$($P -c "select to_regprocedure('private.is_iana_timezone(text)') is null")" = t ] && pass "and nothing of migration 5 was left behind (it ran in one transaction)" || fail "half-applied migration"
+[ "$($P -c "select to_regclass('private.iana_timezones') is null")" = t ] && pass "and nothing of migration 5 was left behind (it ran in one transaction)" || fail "half-applied migration"
 echo "   upgrade-path tests passed"
 psql -d postgres -q -c "drop database if exists $DB"

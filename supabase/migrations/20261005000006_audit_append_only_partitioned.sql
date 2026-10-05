@@ -8,6 +8,7 @@
 
 ------------------------------------------------------------------ 1. swap the table (rows are kept, ids are kept)
 begin;
+set local lock_timeout = '5s';   -- give up instead of queueing behind a long transaction (and everything behind it)
 
 lock table audit.log in access exclusive mode;
 alter table audit.log rename to log_unpartitioned;
@@ -83,6 +84,21 @@ select audit.protect_partition('audit.log_default');
 create function audit.utc_month(p_ts timestamptz default now()) returns date
 language sql stable set search_path = '' as $$ select date_trunc('month', p_ts at time zone 'UTC')::date $$;
 
+-- Creates the table first and attaches it afterwards. CREATE TABLE ... PARTITION OF takes ACCESS EXCLUSIVE on the parent and
+-- stalled every audited write behind one open transaction for the whole lock timeout (measured: 4 s); ATTACH PARTITION takes
+-- only SHARE UPDATE EXCLUSIVE, which ordinary inserts do not conflict with. Returns false when the month already exists.
+create function audit.create_month_partition(p_month date) returns boolean
+language plpgsql security definer set search_path = '' set lock_timeout = '5s' as $$
+declare v_name text := format('log_%s', to_char(p_month, 'YYYY_MM'));
+begin
+  if to_regclass('audit.' || v_name) is not null then return false; end if;
+  execute format('create table audit.%I (like audit.log including defaults including constraints including indexes)', v_name);
+  execute format('alter table audit.log attach partition audit.%I for values from (%L) to (%L)', v_name,
+                 to_char(p_month, 'YYYY-MM-DD') || ' 00:00:00+00', to_char(p_month + interval '1 month', 'YYYY-MM-DD') || ' 00:00:00+00');
+  perform audit.protect_partition(format('audit.%I', v_name)::regclass);
+  return true;
+end $$;
+
 -- Rows that landed in the default partition (the job was late) are moved into real partitions with DDL and INSERT
 -- only: detach the default, create the months, insert the rows through the parent, drop the emptied table.
 -- No UPDATE or DELETE is needed, so the append-only rule has no exception in it.
@@ -98,11 +114,7 @@ begin
   alter table audit.log detach partition audit.log_default;
   alter table audit.log_default rename to log_default_stranded;
   for m in select distinct audit.utc_month(at) from audit.log_default_stranded order by 1 loop
-    if to_regclass(format('audit.log_%s', to_char(m, 'YYYY_MM'))) is null then
-      execute format('create table audit.log_%s partition of audit.log for values from (%L) to (%L)',
-                     to_char(m, 'YYYY_MM'), to_char(m, 'YYYY-MM-DD') || ' 00:00:00+00', to_char(m + interval '1 month', 'YYYY-MM-DD') || ' 00:00:00+00');
-      perform audit.protect_partition(format('audit.log_%s', to_char(m, 'YYYY_MM'))::regclass);
-    end if;
+    perform audit.create_month_partition(m);
   end loop;
   insert into audit.log overriding system value
     select id, at, txid, actor, jwt_role, session_role, effective_role, request_id, table_name, op, row_id, old_row, new_row
@@ -128,9 +140,7 @@ begin
       perform audit.repair_default_partition();     -- creates this month too
       if to_regclass('audit.' || v_name) is not null then n := n + 1; continue; end if;
     end if;
-    execute format('create table audit.%I partition of audit.log for values from (%L) to (%L)',
-                   v_name, to_char(m, 'YYYY-MM-DD') || ' 00:00:00+00', to_char(m + interval '1 month', 'YYYY-MM-DD') || ' 00:00:00+00');
-    perform audit.protect_partition(format('audit.%I', v_name)::regclass);
+    perform audit.create_month_partition(m);
     n := n + 1;
   end loop;
   return n;
@@ -215,21 +225,29 @@ grant select on audit.partition_health to service_role;
 
 revoke all on function audit.deny_change(), audit.protect_partition(regclass), audit.utc_month(timestamptz),
   audit.repair_default_partition(), audit.ensure_partitions(date, date), audit.drop_old_partitions(int),
-  audit.setting_json(text), audit.log_change(), audit.default_rows() from public, anon, authenticated, service_role;
+  audit.setting_json(text), audit.log_change(), audit.default_rows(), audit.create_month_partition(date) from public, anon, authenticated, service_role;
 
--- Scheduling needs pg_cron (Supabase: Database > Extensions). Without it the two calls must be scheduled elsewhere.
-create function audit.schedule_maintenance() returns boolean
+-- Scheduling needs pg_cron (Supabase: Database > Extensions). Creating partitions is harmless, so this migration schedules
+-- that job when pg_cron is present. RETENTION DELETES history, so it is opt-in: after you have decided how long to keep the log
+-- (and archived what must outlive it), run  select audit.schedule_maintenance(24);  to add the monthly drop. Without pg_cron,
+-- run audit.ensure_partitions() daily (and audit.drop_old_partitions(n) monthly) from any scheduler.
+create function audit.schedule_maintenance(p_retention_months int default null) returns boolean
 language plpgsql security definer set search_path = '' as $$
 begin
+  if p_retention_months is not null and p_retention_months < 12 then
+    raise exception 'refusing to schedule retention below 12 months (asked for %)', p_retention_months;
+  end if;
   if to_regprocedure('cron.schedule(text,text,text)') is null then
-    raise notice 'pg_cron is not installed: schedule audit.ensure_partitions() daily and audit.drop_old_partitions(24) monthly yourself, then re-run audit.schedule_maintenance() once pg_cron is on';
+    raise notice 'pg_cron is not installed: schedule audit.ensure_partitions() daily yourself, then run audit.schedule_maintenance() once pg_cron is on';
     return false;
   end if;
-  perform cron.schedule('audit-ensure-partitions',   '15 3 * * *', 'select audit.ensure_partitions()');
-  perform cron.schedule('audit-drop-old-partitions', '30 3 1 * *', 'select audit.drop_old_partitions(24)');
+  perform cron.schedule('audit-ensure-partitions', '15 3 * * *', 'select audit.ensure_partitions()');
+  if p_retention_months is not null then
+    perform cron.schedule('audit-drop-old-partitions', '30 3 1 * *', format('select audit.drop_old_partitions(%s)', p_retention_months));
+  end if;
   return true;
 end $$;
-revoke all on function audit.schedule_maintenance() from public, anon, authenticated, service_role;
+revoke all on function audit.schedule_maintenance(int) from public, anon, authenticated, service_role;
 select audit.schedule_maintenance();
 
 commit;

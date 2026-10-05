@@ -122,7 +122,9 @@ begin
       values (df1, lf1, ct, now(), 7), (df2, lf2, ct, now(), 11), (dz, lz, ct, now(), 13);
 
     r := pg_temp.try(format($q$insert into public.markets (client_id, name, timezone) values (%L, 'Bad', 'Mars/Base')$q$, cf));
-    res := pg_temp.rec(res, 'time zone: an unknown zone name is refused', r = '23514', r);
+    res := pg_temp.rec(res, 'time zone: an unknown zone name is refused', r = '23503', r);
+    r := pg_temp.try(format($q$update public.markets set timezone = 'America/Chicago' where id = %L$q$, mf));
+    res := pg_temp.rec(res, 'time zone: a market that already has budgets cannot change its zone', r = '23514', r);
     select delivered_cents into k from public.budget_vs_spend where market_id = mf and budget_month = '2026-01-01';
     res := pg_temp.rec(res, 'time zone: New York 23:59 on 31 Jan counts in January (7)', k = 7, k::text);
     select delivered_cents into k from public.budget_vs_spend where market_id = mf and budget_month = '2026-02-01';
@@ -171,6 +173,12 @@ begin
     res := pg_temp.rec(res, 'audit: even the table owner is stopped by the trigger (DELETE)', r = '42501', r);
     r := pg_temp.try($q$truncate audit.log$q$);
     res := pg_temp.rec(res, 'audit: even the table owner is stopped by the trigger (TRUNCATE)', r = '42501', r);
+
+    select count(*) into k from information_schema.role_table_grants
+      where grantee = 'service_role' and table_schema = 'public' and privilege_type in ('TRUNCATE', 'TRIGGER', 'REFERENCES');
+    res := pg_temp.rec(res, 'privileges: service_role holds no TRUNCATE, TRIGGER or REFERENCES on any public table', k = 0, k::text);
+    res := pg_temp.rec(res, 'privileges: service_role cannot SET session_replication_role (it would switch triggers off)',
+                       not has_parameter_privilege('service_role', 'session_replication_role', 'SET'), 'has_parameter_privilege');
 
     raise exception 'rollback everything' using errcode = 'P0099';
   exception when sqlstate 'P0099' then null;
